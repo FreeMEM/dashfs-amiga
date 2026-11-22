@@ -1,0 +1,84 @@
+# El cliente de la prueba (pruebas/correr.py): monta el disco DashFS de hacer_disco tres veces (lo de ahora, la
+# instantánea "antes" y el volumen "Otro") y recorre cada uno: "D ruta" y "F ruta tamaño suma"; luego unas pruebas
+# sueltas. Las líneas van con el nombre del montaje delante.
+
+# la suma de los ficheros del manifiesto: cada byte por (su posición % 251) + 1, módulo 2^32
+asm func suma(buf: Int, n: Int) -> Int in a0 = buf, d0 = n out d1 uses d2-d4
+    moveq   #0,d1
+    moveq   #1,d3           ; (posición % 251) + 1
+    bra     .cuenta
+.byte:
+    moveq   #0,d2
+    move.b  (a0)+,d2
+    mulu.w  d3,d2
+    add.l   d2,d1
+    addq.w  #1,d3
+    cmp.w   #252,d3
+    bne     .cuenta
+    moveq   #1,d3
+.cuenta:
+    subq.l  #1,d0
+    bpl     .byte
+end
+
+func recorrer(mnt: String, ruta: String, buf: Int)
+    dir = mnt + ":" + ruta
+    n = dir_read(dir)
+    var nombres: [String] = []
+    var cajon: [Bool] = []
+    for i in (0..n - 1)
+        nombres.push(dir_entry_name(i))
+        cajon.push(dir_entry_is_dir(i))
+    end
+    i = 0
+    for nombre in nombres
+        r = ruta + nombre
+        if cajon[i]
+            Print "#{mnt} D #{r}"
+            recorrer(mnt, r + "/", buf)
+        else
+            t = file_size(mnt + ":" + r)
+            got = file_load(mnt + ":" + r, buf, 1048576)
+            s = suma(buf, got)
+            Print "#{mnt} F #{r} #{t} #{str_from_int((s >> 16) & 0xFFFF, 16)}:#{str_from_int(s & 0xFFFF, 16)}"
+        end
+        i = i + 1
+    end
+end
+
+func montar(nombre: String, control: String) -> Int
+    ml = "#{nombre}:\n  FileSystem = DH0:dashfs-handler\n  Device = uaehf.device\n  Unit = 1\n  Flags = 0\n" +
+         "  Surfaces = 1\n  BlocksPerTrack = 32\n  Reserved = 0\n  LowCyl = 0\n  HighCyl = 511\n  BlockSize = 512\n" +
+         "  Buffers = 5\n  DosType = 0x44465301\n  GlobVec = -1\n  StackSize = 16384\n" +
+         "  Control = \"#{control}\"\n  Activate = 1\n#\n"
+    file_write_text("RAM:#{nombre}.ml", ml)
+    return run_command("C:Mount #{nombre}: FROM RAM:#{nombre}.ml")
+end
+
+Main
+    dos_requesters(false)
+    buf = buffer_alloc(1048576)
+    t = time_ms()
+    Print "montar: #{montar("DFS0", "LOG=RAM:DFS0.log")} #{montar("DFS1", "INSTANTANEA=antes LOG=RAM:DFS1.log")} #{montar("DFS2", "VOLUMEN=Otro")}"
+    for m in ["DFS0", "DFS1", "DFS2"]
+        t1 = time_ms()
+        recorrer(m, "", buf)
+        Print "tiempo de #{m}: #{time_ms() - t1} ms"
+    end
+    Print "tiempo del recorrido: #{time_ms() - t} ms"
+    Print "nota: #{file_comment("DFS0:con nota")}"
+    Print "bits: #{file_protection("DFS0:con nota")}"
+    Print "sin mayúsculas: #{file_exists("DFS0:LÉEME.TXT")} #{file_exists("DFS0:cajón/SUB/Hondo.txt")}"
+    Print "exacto: #{file_read_text("DFS0:Exacto/a")}#{file_read_text("DFS0:Exacto/A")}"
+    Print "no está: #{file_exists("DFS0:nada")} #{file_exists("DFS0:Cajón/nada/x")}"
+    Print "subir: #{file_read_text("DFS0:Cajón/Sub//dentro.txt")}"
+    Print "escribir: #{file_write_text("DFS0:nuevo", "x")}"
+    f = file_open("DFS0:azar.bin", 1005)
+    file_seek(f, 150000, -1)
+    n = file_read(f, buf, 16)
+    Print "seek: #{n} #{file_pos(f)}"
+    file_close(f)
+    Print "volúmenes: #{file_exists("DashFS:")} #{file_exists("DashFS antes:")} #{file_exists("Otro:")}"
+    Print "libre: #{path_free_kb("DFS0:")}"
+    Print "registro: #{str_split(file_read_text("RAM:DFS0.log"), "\n")[0]}"
+end

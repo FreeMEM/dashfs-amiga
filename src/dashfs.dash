@@ -1,0 +1,970 @@
+# DashFS de solo lectura para AmigaOS 3.x: un handler de DOS escrito en Dash (./dash --handler, docs/HANDLER_LOOP.md
+# de Dash, fase 2). Lee los discos DashFS que hace DashOS o Linux (redoxfs-ar, redoxfs-mkfs): números en
+# little-endian, sumas seahash, registros con LZ4, carpetas H-tree, nombres sin distinguir mayúsculas, el comentario
+# y los bits del Amiga, instantáneas y volúmenes. Sin cifrado. Para 68020 o más:
+#
+#     ./dash --cpu 68020 src/dashfs.dash -o L:DashFS-handler
+#
+# Mountlist (con la geometría de la partición; un disco DashFS entero, desde el cilindro 0):
+#
+#     DFS0:
+#         FileSystem = L:DashFS-handler
+#         Device = scsi.device
+#         Unit = 1
+#         Surfaces = 1
+#         BlocksPerTrack = 32
+#         Reserved = 0
+#         LowCyl = 0
+#         HighCyl = 1023
+#         BlockSize = 512
+#         Buffers = 5
+#         DosType = 0x44465301
+#         GlobVec = -1
+#         StackSize = 16384
+#         Control = "VOLUMEN=Otro INSTANTANEA=antes NOMBRE=Mio SINSUMAS LOG=T:dfs.log"
+#         Activate = 1
+#     #
+#
+# Control (todo opcional): VOLUMEN= otro volumen del disco (el principal si no), INSTANTANEA= una instantánea (lo de
+# ahora si no), NOMBRE= el nombre del volumen en el Amiga ("DashFS", o el del volumen), SINSUMAS no comprueba las
+# sumas de los datos de los ficheros (las de la estructura sí: va más rápido), LOG= un registro.
+import "lib/amiga/handler.dash"
+import "lz4.dash"
+import "seahash.dash"
+
+const BLOCK = 4096
+const NODE_ROOT = 1
+
+# ---- Lo de little-endian (en ensamblador: un ror y un swap) ----
+
+asm func le32(p: Int) -> Int in a0 = p
+    move.l  (a0),d0
+    ror.w   #8,d0
+    swap    d0
+    ror.w   #8,d0
+end
+
+asm func le16(p: Int) -> Int in a0 = p
+    moveq   #0,d0
+    move.w  (a0),d0
+    ror.w   #8,d0
+end
+
+# ---- El estado ----
+
+var dev: Int = 0
+var first_sector: Int = 0        # el primer sector de la partición
+var sectors_per_block: Int = 8   # sectores del dispositivo por bloque de DashFS (4096 / tamaño de sector)
+var sector_size: Int = 512
+var volume: Int = 0
+var vol_name: String = "DashFS"
+var disk_blocks: Int = 0
+var check_data: Bool = true
+var created: Int = 0
+
+# la raíz del árbol de nodos que se lee (la del volumen o la de su instantánea): un BlockPtr de 16 bytes
+var tree_ptr: Int = 0
+var snapshots_ptr: Int = 0       # (la lista de instantáneas del volumen elegido)
+var hdr_volumes: Int = 0         # (la lista de volúmenes)
+
+# los bloques ya leídos y comprobados (la estructura: nodos, listas, carpetas), por su número
+var cache: {Int: Int} = {}
+var cache_used: {Int: Int} = {}  # cuándo se usó cada uno (sale el más viejo)
+var cache_clock: Int = 0
+const CACHE_MAX = 96
+
+var raw: Int = 0                 # lo leído de un registro (hasta 128 KB)
+var rec: Int = 0                 # el registro descomprimido
+var rec_node: Int = -1           # qué registro hay en rec: su nodo y su número
+var rec_no: Int = -1
+var bad: Int = 0                 # el último error de lectura (para los paquetes)
+
+# el padre de cada nodo visto (DashFS no lo guarda: se sabe al bajar desde la raíz)
+var parent_of: {Int: Int} = {}
+
+# las carpetas ya leídas (hasta LISTINGS_MAX; luego se olvidan todas y se empieza otra vez)
+struct Listing
+    names: [String]
+    nodes: [Int]
+    keys: {String: Int}      # el nombre (en minúsculas si la carpeta no las distingue) y su sitio + 1
+    caseless: Bool = true
+end
+var listings: {Int: Listing} = {}
+const LISTINGS_MAX = 24
+var name_of_node: {Int: String} = {}
+
+struct OpenFile
+    id: Int = 0
+    node: Int = 0
+    pos: Int = 0
+    size: Int = 0
+end
+var opens: [OpenFile] = []
+var next_open: Int = 1
+
+# ---- BlockPtr ----
+
+func ptr_index(p: Int) -> Int
+    return ((le32(p) >> 8) & 0xFFFFFF) | ((le32(p + 4) & 0xFFF) << 24)
+end
+
+func ptr_level(p: Int) -> Int
+    return le32(p) & 15
+end
+
+func ptr_decomp(p: Int) -> Int
+    return (le32(p) >> 4) & 15
+end
+
+func ptr_null(p: Int) -> Bool
+    return ptr_index(p) == 0
+end
+
+func ptr_marker(p: Int) -> Bool
+    return (le32(p) | 15) == -1 and le32(p + 4) == -1 and le32(p + 8) == -1 and le32(p + 12) == -1
+end
+
+# ---- Leer del disco ----
+
+# bytes desde el bloque index de DashFS, sin comprobar
+func read_raw(index: Int, buf: Int, bytes: Int) -> Bool
+    e = dev_read(dev, first_sector + index * sectors_per_block, sector_size, buf, bytes)
+    if e != 0
+        Print "error #{e} del dispositivo en el bloque #{index}"
+        bad = ERROR_SEEK_ERROR
+        return false
+    end
+    return true
+end
+
+# la suma del BlockPtr p sobre n bytes de buf
+func hash_ok(p: Int, buf: Int, n: Int) -> Bool
+    lo = seahash(buf, n)
+    return lo == le32(p + 8) and seahash_hi == le32(p + 12)
+end
+
+# un bloque de la estructura (nivel 0, 4096 bytes) por su BlockPtr: su dirección en la caché, 0 si no se puede leer
+func block(p: Int) -> Int
+    if ptr_null(p) or ptr_level(p) != 0
+        bad = ERROR_OBJECT_NOT_FOUND
+        return 0
+    end
+    # (todo lo del puntero, antes de tocar la caché: p puede estar en el bloque que se va)
+    index = ptr_index(p)
+    hlo = le32(p + 8)
+    hhi = le32(p + 12)
+    cache_clock = cache_clock + 1
+    b = cache.get(index, 0)
+    if b != 0
+        cache_used[index] = cache_clock
+        return b
+    end
+    if cache.length >= CACHE_MAX
+        # sale el que lleva más tiempo sin usarse
+        old = -1
+        oldest = cache_clock
+        for k in cache.keys()
+            u = cache_used.get(k, 0)
+            if u < oldest
+                oldest = u
+                old = k
+            end
+        end
+        b = cache.get(old, 0)
+        cache.remove(old)
+        cache_used.remove(old)
+    else
+        b = buffer_alloc(BLOCK)
+    end
+    if not read_raw(index, b, BLOCK)
+        buffer_free(b)
+        return 0
+    end
+    lo = seahash(b, BLOCK)
+    if lo != hlo or seahash_hi != hhi
+        Print "suma mala en el bloque #{index}"
+        buffer_free(b)
+        bad = ERROR_SEEK_ERROR
+        return 0
+    end
+    cache[index] = b
+    cache_used[index] = cache_clock
+    return b
+end
+
+# ---- La cabecera ----
+
+# la cabecera más nueva y buena del anillo (256 bloques al principio): false si no hay
+func read_header() -> Bool
+    buf = buffer_alloc(BLOCK)
+    best = -1
+    best_gen = -1
+    # primero la generación de cada una (sus primeros bytes)
+    var gens: [Int] = []
+    for i in (0..255)
+        g = -1
+        if read_raw(i, buf, sector_size)
+            sig = str_from_buffer(buf, 0, 6)
+            if sig == "DashFS" or sig == "RedoxF"
+                g = le32(buf + 40)
+            end
+        end
+        gens.push(g)
+    end
+    # la de generación mayor cuya suma esté bien
+    while true
+        best = -1
+        best_gen = -1
+        for i in (0..255)
+            if gens[i] > best_gen
+                best = i
+                best_gen = gens[i]
+            end
+        end
+        if best < 0
+            buffer_free(buf)
+            return false
+        end
+        if read_raw(best, buf, BLOCK)
+            lo = seahash(buf, 4072)
+            if lo == le32(buf + 4088) and seahash_hi == le32(buf + 4092)
+                break
+            end
+        end
+        gens[best] = -1
+    end
+    Print "cabecera: bloque #{best}, generación #{best_gen}, versión #{le32(buf + 8)}"
+    disk_blocks = le32(buf + 32)
+    # (tree 48, alloc 64, 64 huecos de llaves de 48 bytes desde 80; release, epoch, latest, snapshots, dead, volumes)
+    o = 80 + 64 * 48
+    tree_ptr = amiga_alloc(16)
+    buffer_copy(tree_ptr, 0, buf, 48, 16)
+    snapshots_ptr = amiga_alloc(16)
+    buffer_copy(snapshots_ptr, 0, buf, o + 32, 16)
+    hdr_volumes = amiga_alloc(16)
+    buffer_copy(hdr_volumes, 0, buf, o + 64, 16)
+    buffer_free(buf)
+    return true
+end
+
+# entra en el volumen de ese nombre (FS10b): su árbol y sus instantáneas
+func enter_volume(name: String) -> Bool
+    p = hdr_volumes
+    while not ptr_null(p)
+        b = block(p)
+        if b == 0
+            return false
+        end
+        for k in (0..(BLOCK - 16) / 208 - 1)
+            o = b + 16 + k * 208
+            n = peek_byte(o + 136)
+            if n > 0 and utf8_to_latin1(str_from_buffer(o + 144, 0, n)) == name
+                if (le32(o + 100) & 1) != 0
+                    Print "el volumen #{name} está cifrado: no se puede leer"
+                    return false
+                end
+                buffer_copy(tree_ptr, 0, o, 8, 16)
+                buffer_copy(snapshots_ptr, 0, o, 48, 16)
+                return true
+            end
+        end
+        p = b
+    end
+    Print "no hay volumen #{name}"
+    return false
+end
+
+# lee la instantánea de ese nombre (FS9): su árbol
+func enter_snapshot(name: String) -> Bool
+    p = snapshots_ptr
+    while not ptr_null(p)
+        b = block(p)
+        if b == 0
+            return false
+        end
+        for k in (0..(BLOCK - 16) / 136 - 1)
+            o = b + 16 + k * 136
+            n = peek_byte(o + 20)
+            if n > 0 and utf8_to_latin1(str_from_buffer(o + 72, 0, n)) == name
+                buffer_copy(tree_ptr, 0, o, 24, 16)
+                return true
+            end
+        end
+        p = b
+    end
+    Print "no hay instantánea #{name}"
+    return false
+end
+
+# ---- Nodos ----
+
+# el bloque del nodo id (cuatro niveles de TreeList de 254 punteros), 0 si no está
+func node(id: Int) -> Int
+    if id <= 0
+        bad = ERROR_OBJECT_NOT_FOUND
+        return 0
+    end
+    b = block(tree_ptr)
+    shift = 24
+    while shift >= 0 and b != 0
+        i = (id >> shift) & 255
+        if i >= 254
+            bad = ERROR_OBJECT_NOT_FOUND
+            return 0
+        end
+        b = block(b + i * 16)
+        shift = shift - 8
+    end
+    return b
+end
+
+func node_mode(n: Int) -> Int
+    return le16(n)
+end
+
+func node_is_dir(n: Int) -> Bool
+    return (le16(n) & 0xF000) == 0x4000
+end
+
+func node_size(n: Int) -> Int
+    return le32(n + 14)
+end
+
+func node_mtime(n: Int) -> Int
+    return le32(n + 42)
+end
+
+func node_flags(n: Int) -> Int
+    return le32(n + 70)
+end
+
+# los bits de FileInfoBlock: RWED al revés (de los permisos del dueño y "no borrar") y ASPH (los del Amiga)
+func node_protection(n: Int) -> Int
+    mode = le16(n)
+    amiga = le32(n + 74)
+    p = 0
+    if (mode & 0x100) == 0
+        p = p | FIBF_READ
+    end
+    if (mode & 0x80) == 0
+        p = p | FIBF_WRITE
+    end
+    if (mode & 0x40) == 0 and not node_is_dir(n)
+        p = p | FIBF_EXECUTE
+    end
+    if (amiga & 16) != 0
+        p = p | FIBF_DELETE
+    end
+    if (amiga & 1) != 0
+        p = p | FIBF_ARCHIVE
+    end
+    if (amiga & 2) != 0
+        p = p | 32     # P
+    end
+    if (amiga & 4) != 0
+        p = p | 64     # S
+    end
+    if (amiga & 8) != 0
+        p = p | 128    # H
+    end
+    return p
+end
+
+# el comentario del Amiga ("amiga.comment" en el bloque de atributos), en Latin-1
+func node_comment(n: Int) -> String
+    if ptr_null(n + 78)
+        return ""
+    end
+    b = block(n + 78)
+    if b == 0
+        return ""
+    end
+    used = le16(b)
+    o = 2
+    while o + 3 <= 2 + used and o + 3 <= BLOCK
+        kl = peek_byte(b + o)
+        vl = le16(b + o + 1)
+        if kl == 13 and str_from_buffer(b, o + 3, 13) == "amiga.comment"
+            c = utf8_to_latin1(str_from_buffer(b, o + 3 + kl, vl))
+            if c.length > 79
+                c = c[0:79]
+            end
+            return c
+        end
+        o = o + 3 + kl + vl
+    end
+    return ""
+end
+
+# ---- Carpetas ----
+
+# la carpeta id leída entera (todas las hojas de su H-tree), nil si no se puede
+func read_dir(id: Int) -> Listing
+    l = listings.get(id, nil)
+    if l != nil
+        return l
+    end
+    n = node(id)
+    if n == 0
+        return nil
+    end
+    if not node_is_dir(n)
+        bad = ERROR_OBJECT_WRONG_TYPE
+        return nil
+    end
+    l = Listing([], [], {}, (node_flags(n) & 2) != 0)
+    if ptr_marker(n + 128)
+        levels = ptr_level(n + 128)
+        if not dir_walk(l, n + 144, levels)
+            return nil
+        end
+    end
+    i = 0
+    for e in l.names
+        if l.caseless
+            l.keys[str_lower(e)] = i + 1
+        else
+            l.keys[e] = i + 1
+        end
+        i = i + 1
+    end
+    if listings.length >= LISTINGS_MAX
+        listings.clear()
+    end
+    listings[id] = l
+    return l
+end
+
+func dir_walk(l: Listing, p: Int, levels: Int) -> Bool
+    b = block(p)
+    if b == 0
+        return false
+    end
+    if levels == 0
+        count = le16(b + 4092)
+        o = 0
+        for k in (1..count)
+            if o + 5 > 4092
+                break
+            end
+            child = le32(b + o)
+            len = peek_byte(b + o + 4)
+            l.names.push(utf8_to_latin1(str_from_buffer(b, o + 5, len)))
+            l.nodes.push(child)
+            o = o + 5 + len
+        end
+        return true
+    end
+    # un nodo del H-tree: 204 entradas de 20 bytes (hash y BlockPtr), las vacías con el puntero nulo. Una copia:
+    # recorrer sus hojas puede sacarlo de la caché
+    copy = buffer_alloc(BLOCK)
+    buffer_copy(copy, 0, b, 0, BLOCK)
+    ok = true
+    for k in (0..203)
+        q = copy + k * 20 + 4
+        if ok and not ptr_null(q)
+            ok = dir_walk(l, q, levels - 1)
+        end
+    end
+    buffer_free(copy)
+    return ok
+end
+
+# el nodo de name en la carpeta dir (sin mirar mayúsculas si la carpeta no las distingue), -1 si no está
+func lookup(dir: Int, name: String) -> Int
+    l = read_dir(dir)
+    if l == nil
+        return -1
+    end
+    k = 0
+    if l.caseless
+        k = l.keys.get(str_lower(name), 0)
+    else
+        k = l.keys.get(name, 0)
+    end
+    if k == 0
+        bad = ERROR_OBJECT_NOT_FOUND
+        return -1
+    end
+    child = l.nodes[k - 1]
+    parent_of[child] = dir
+    name_of_node[child] = l.names[k - 1]
+    return child
+end
+
+# el nodo de una ruta de AmigaDOS desde la carpeta base: "Vol:a/b", ":a", "a//b" (// sube), "/" (la madre)
+func resolve(base: Int, path: String) -> Int
+    cur = base
+    s = path
+    c = str_find(s, ":")
+    if c >= 0
+        cur = NODE_ROOT
+        s = s[c + 1:]
+    end
+    i = 0
+    while i <= s.length
+        j = str_find_from(s, "/", i)
+        if j < 0
+            j = s.length
+        end
+        part = s[i:j]
+        if part == ""
+            if j < s.length
+                # "/" sin nombre: la madre
+                if cur == NODE_ROOT
+                    bad = ERROR_OBJECT_NOT_FOUND
+                    return -1
+                end
+                cur = parent_of.get(cur, NODE_ROOT)
+            end
+        else
+            n = node(cur)
+            if n == 0 or not node_is_dir(n)
+                bad = ERROR_OBJECT_WRONG_TYPE
+                return -1
+            end
+            cur = lookup(cur, part)
+            if cur < 0
+                return -1
+            end
+        end
+        i = j + 1
+    end
+    return cur
+end
+
+# ---- Datos de los ficheros ----
+
+# el BlockPtr del registro r del nodo n (128 directos; luego listas de 1 a 4 niveles, NodeLevel::new), 0 si no hay
+func record_ptr(n: Int, r: Int) -> Int
+    base = n + 128
+    if r < 128
+        return base + r * 16
+    end
+    r = r - 128
+    if r < 64 * 256
+        p = base + (128 + (r >> 8)) * 16
+        return list_walk(p, r, 1)
+    end
+    r = r - 64 * 256
+    if r < 32 * 65536
+        p = base + (192 + (r >> 16)) * 16
+        return list_walk(p, r, 2)
+    end
+    r = r - 32 * 65536
+    if r < 16 * 16777216
+        p = base + (224 + (r >> 24)) * 16
+        return list_walk(p, r, 3)
+    end
+    return 0    # (más de 2 GB: no se llega con un Int)
+end
+
+func list_walk(p: Int, r: Int, levels: Int) -> Int
+    k = levels - 1
+    while k >= 0
+        if ptr_null(p)
+            return p
+        end
+        b = block(p)
+        if b == 0
+            return 0
+        end
+        p = b + ((r >> (8 * k)) & 255) * 16
+        k = k - 1
+    end
+    return p
+end
+
+# pone en rec el registro r del fichero id (nodo n): false si no se pudo leer
+func load_record(id: Int, n: Int, r: Int) -> Bool
+    if rec_node == id and rec_no == r
+        return true
+    end
+    rec_node = -1
+    level = le32(n + 66)
+    rsize = BLOCK << level
+    p = record_ptr(n, r)
+    if p == 0
+        return false
+    end
+    if ptr_null(p)
+        buffer_fill(rec, 0, rsize, 0)        # un hueco: ceros
+    else
+        stored = BLOCK << ptr_level(p)
+        if stored > 131072
+            bad = ERROR_OBJECT_TOO_LARGE
+            return false
+        end
+        if not read_raw(ptr_index(p), raw, stored)
+            return false
+        end
+        if check_data and not hash_ok(p, raw, stored)
+            Print "suma mala en el registro #{r} del nodo #{id}"
+            bad = ERROR_SEEK_ERROR
+            return false
+        end
+        d = ptr_decomp(p)
+        got = stored
+        if d != 0
+            clen = le16(raw)
+            got = lz4(raw + 2, clen, rec, BLOCK << d)
+            if got < 0
+                Print "LZ4 roto en el registro #{r} del nodo #{id}"
+                bad = ERROR_SEEK_ERROR
+                return false
+            end
+        else
+            buffer_copy(rec, 0, raw, 0, stored)
+        end
+        if got < rsize
+            buffer_fill(rec, got, rsize - got, 0)
+        end
+    end
+    rec_node = id
+    rec_no = r
+    return true
+end
+
+# lee hasta len bytes del fichero desde pos a dst: cuántos, o -1
+func file_read_at(id: Int, pos: Int, dst: Int, len: Int) -> Int
+    n = node(id)
+    if n == 0
+        return -1
+    end
+    size = node_size(n)
+    if pos >= size
+        return 0
+    end
+    if len > size - pos
+        len = size - pos
+    end
+    if (node_flags(n) & 1) != 0
+        buffer_copy(dst, 0, n, 128 + pos, len)     # los datos en el nodo
+        return len
+    end
+    rsize = BLOCK << le32(n + 66)
+    done = 0
+    while done < len
+        r = (pos + done) / rsize
+        off = (pos + done) % rsize
+        if not load_record(id, n, r)
+            return -1
+        end
+        n = node(id)         # (load_record pudo sacar el nodo de la caché)
+        k = rsize - off
+        if k > len - done
+            k = len - done
+        end
+        buffer_copy(dst, done, rec, off, k)
+        done = done + k
+    end
+    return done
+end
+
+# ---- FileInfoBlock ----
+
+func fill_fib(fib: Int, id: Int, name: String) -> Bool
+    n = node(id)
+    if n == 0
+        return false
+    end
+    if id == NODE_ROOT
+        fib_fill(fib, 0, ST_ROOT, vol_name, 0, 0, node_mtime(n), "")
+    elif node_is_dir(n)
+        fib_fill(fib, 0, ST_USERDIR, name, 0, node_protection(n), node_mtime(n), node_comment(n))
+    else
+        fib_fill(fib, 0, ST_FILE, name, node_size(n), node_protection(n), node_mtime(n), node_comment(n))
+    end
+    # (fib_fill pone fib_DiskKey = 0: EXAMINE_NEXT cuenta desde ahí)
+    return true
+end
+
+# el nombre del nodo id, mirando en su madre
+func name_of(id: Int) -> String
+    if id == NODE_ROOT
+        return vol_name
+    end
+    return name_of_node.get(id, "")
+end
+
+func open_by_id(id: Int) -> OpenFile
+    for o in opens
+        if o.id == id
+            return o
+        end
+    end
+    return nil
+end
+
+func new_open(id: Int, fh: Int) -> Int
+    n = node(id)
+    if n == 0
+        return DOSFALSE
+    end
+    o = OpenFile(next_open, id, 0, node_size(n))
+    next_open = next_open + 1
+    opens.push(o)
+    h = Ptr FileHandle(baddr(fh))
+    h.fh_Args = o.id
+    h.fh_Port = 0
+    return DOSTRUE
+end
+
+# ---- Control ----
+
+# el valor de CLAVE= en el texto de Control ("" si no está); los espacios separan
+func option(control: String, key: String) -> String
+    for w in str_split(control, " ")
+        if str_starts(str_upper(w), key + "=")
+            return w[key.length + 1:]
+        end
+    end
+    return ""
+end
+
+func control_text() -> String
+    e = fssm_env()
+    if e == 0
+        return ""
+    end
+    d = Ptr DosEnvec(e)
+    if d.de_TableSize < 18 or d.de_Control == 0
+        return ""
+    end
+    s = bstr_text(d.de_Control)
+    return str_replace(s, "\"", "")
+end
+
+# ---- El handler ----
+# la clave de una cerradura (su nodo), la raíz para la cerradura 0
+func lock_key_or_root(lock: Int) -> Int
+    if lock == 0
+        return NODE_ROOT
+    end
+    return lock_key(lock)
+end
+
+
+Main
+    control = control_text()
+    log = option(control, "LOG")
+    if log != ""
+        handler_log(log)
+    end
+    check_data = not str_contains(str_upper(control), "SINSUMAS")
+    dev = fssm_open()
+    if dev == 0
+        Print "#{handler_name()}: no se abre #{fssm_device()} unidad #{fssm_unit()}"
+        handler_ready(false, ERROR_NO_DISK)
+        program_exit(20)
+    end
+    sector_size = fssm_block_size()
+    sectors_per_block = BLOCK / sector_size
+    first_sector = fssm_first_block()
+    raw = buffer_alloc(131072)
+    rec = buffer_alloc(131072)
+    if raw == 0 or rec == 0 or not read_header()
+        Print "#{handler_name()}: no es un disco DashFS"
+        handler_ready(false, ERROR_NOT_A_DOS_DISK)
+        program_exit(20)
+    end
+    v = option(control, "VOLUMEN")
+    if v != ""
+        if not enter_volume(v)
+            handler_ready(false, ERROR_OBJECT_NOT_FOUND)
+            program_exit(20)
+        end
+        vol_name = v
+    end
+    s = option(control, "INSTANTANEA")
+    if s != ""
+        if not enter_snapshot(s)
+            handler_ready(false, ERROR_OBJECT_NOT_FOUND)
+            program_exit(20)
+        end
+        vol_name = vol_name + " " + s
+    end
+    nm = option(control, "NOMBRE")
+    if nm != ""
+        vol_name = nm
+    end
+    r = node(NODE_ROOT)
+    if r == 0 or not node_is_dir(r)
+        Print "#{handler_name()}: la raíz no se lee"
+        handler_ready(false, ERROR_NOT_A_DOS_DISK)
+        program_exit(20)
+    end
+    created = node_mtime(r)
+    volume = handler_volume_add(vol_name, ID_DOS_DISK)
+    Print "#{handler_name()}: volumen #{vol_name}, #{disk_blocks} bloques de 4 KB"
+    handler_ready(true, 0)
+
+    vivo = true
+    while vivo
+        p = handler_wait()
+        if p == 0
+            break
+        end
+        pk = Ptr DosPacket(p)
+        t = pk.dp_Type
+        r1 = DOSFALSE
+        r2 = 0
+        bad = ERROR_OBJECT_NOT_FOUND
+        if t == ACTION_LOCATE_OBJECT
+            id = resolve(lock_key_or_root(pk.dp_Arg1), bstr_text(pk.dp_Arg2))
+            if id < 0
+                r2 = bad
+            elif pk.dp_Arg3 == EXCLUSIVE_LOCK
+                r2 = ERROR_DISK_WRITE_PROTECTED
+            else
+                r1 = lock_new(id, SHARED_LOCK, volume)
+            end
+        elif t == ACTION_FREE_LOCK
+            lock_free(pk.dp_Arg1)
+            r1 = DOSTRUE
+        elif t == ACTION_COPY_DIR
+            r1 = lock_new(lock_key_or_root(pk.dp_Arg1), SHARED_LOCK, volume)
+        elif t == ACTION_PARENT
+            id = lock_key_or_root(pk.dp_Arg1)
+            if id != NODE_ROOT
+                r1 = lock_new(parent_of.get(id, NODE_ROOT), SHARED_LOCK, volume)
+            end
+        elif t == ACTION_SAME_LOCK
+            if lock_key_or_root(pk.dp_Arg1) == lock_key_or_root(pk.dp_Arg2)
+                r1 = DOSTRUE
+            end
+        elif t == ACTION_EXAMINE_OBJECT
+            id = lock_key_or_root(pk.dp_Arg1)
+            if fill_fib(baddr(pk.dp_Arg2), id, name_of(id))
+                r1 = DOSTRUE
+            else
+                r2 = bad
+            end
+        elif t == ACTION_EXAMINE_NEXT
+            id = lock_key_or_root(pk.dp_Arg1)
+            fib = baddr(pk.dp_Arg2)
+            k = Ptr FileInfoBlock(fib).fib_DiskKey
+            l = read_dir(id)
+            if l == nil
+                r2 = bad
+            elif k < 0 or k >= l.nodes.length
+                r2 = ERROR_NO_MORE_ENTRIES
+            else
+                child = l.nodes[k]
+                parent_of[child] = id
+                name_of_node[child] = l.names[k]
+                if fill_fib(fib, child, l.names[k])
+                    fp = Ptr FileInfoBlock(fib)
+                    fp.fib_DiskKey = k + 1
+                    r1 = DOSTRUE
+                else
+                    r2 = bad
+                end
+            end
+        elif t == ACTION_FINDINPUT
+            id = resolve(lock_key_or_root(pk.dp_Arg2), bstr_text(pk.dp_Arg3))
+            if id < 0
+                r2 = bad
+            elif node_is_dir(node(id))
+                r2 = ERROR_OBJECT_WRONG_TYPE
+            else
+                r1 = new_open(id, pk.dp_Arg1)
+            end
+        elif t == ACTION_FINDOUTPUT or t == ACTION_FINDUPDATE or t == ACTION_DELETE_OBJECT or t == ACTION_RENAME_OBJECT or t == ACTION_CREATE_DIR or t == ACTION_SET_PROTECT or t == ACTION_SET_COMMENT or t == ACTION_SET_DATE or t == ACTION_RENAME_DISK
+            r2 = ERROR_DISK_WRITE_PROTECTED
+        elif t == ACTION_FH_FROM_LOCK
+            id = lock_key_or_root(pk.dp_Arg2)
+            if node_is_dir(node(id))
+                r2 = ERROR_OBJECT_WRONG_TYPE
+            else
+                r1 = new_open(id, pk.dp_Arg1)
+                if r1 == DOSTRUE
+                    lock_free(pk.dp_Arg2)
+                end
+            end
+        elif t == ACTION_READ
+            o = open_by_id(pk.dp_Arg1)
+            if o == nil
+                r1 = -1
+                r2 = ERROR_INVALID_LOCK
+            else
+                got = file_read_at(o.node, o.pos, pk.dp_Arg2, pk.dp_Arg3)
+                if got < 0
+                    r1 = -1
+                    r2 = bad
+                else
+                    o.pos = o.pos + got
+                    r1 = got
+                end
+            end
+        elif t == ACTION_WRITE
+            r1 = -1
+            r2 = ERROR_DISK_WRITE_PROTECTED
+        elif t == ACTION_SEEK
+            o = open_by_id(pk.dp_Arg1)
+            if o == nil
+                r1 = -1
+                r2 = ERROR_INVALID_LOCK
+            else
+                np = pk.dp_Arg2
+                if pk.dp_Arg3 == OFFSET_CURRENT
+                    np = o.pos + pk.dp_Arg2
+                elif pk.dp_Arg3 == OFFSET_END
+                    np = o.size + pk.dp_Arg2
+                end
+                if np < 0 or np > o.size
+                    r1 = -1
+                    r2 = ERROR_SEEK_ERROR
+                else
+                    r1 = o.pos
+                    o.pos = np
+                end
+            end
+        elif t == ACTION_END
+            i = 0
+            while i < opens.length
+                if opens[i].id == pk.dp_Arg1
+                    opens.remove(i)
+                    break
+                end
+                i = i + 1
+            end
+            r1 = DOSTRUE
+        elif t == ACTION_EXAMINE_FH
+            o = open_by_id(pk.dp_Arg1)
+            if o != nil and fill_fib(baddr(pk.dp_Arg2), o.node, name_of(o.node))
+                r1 = DOSTRUE
+            else
+                r2 = ERROR_INVALID_LOCK
+            end
+        elif t == ACTION_PARENT_FH
+            o = open_by_id(pk.dp_Arg1)
+            if o != nil
+                r1 = lock_new(parent_of.get(o.node, NODE_ROOT), SHARED_LOCK, volume)
+            end
+        elif t == ACTION_COPY_DIR_FH
+            o = open_by_id(pk.dp_Arg1)
+            if o != nil
+                r1 = lock_new(o.node, SHARED_LOCK, volume)
+            end
+        elif t == ACTION_DISK_INFO
+            info_fill(baddr(pk.dp_Arg1), disk_blocks, disk_blocks, BLOCK, ID_WRITE_PROTECTED, volume)
+            r1 = DOSTRUE
+        elif t == ACTION_INFO
+            info_fill(baddr(pk.dp_Arg2), disk_blocks, disk_blocks, BLOCK, ID_WRITE_PROTECTED, volume)
+            r1 = DOSTRUE
+        elif t == ACTION_IS_FILESYSTEM or t == ACTION_FLUSH or t == ACTION_INHIBIT or t == ACTION_MORE_CACHE
+            r1 = DOSTRUE
+        elif t == ACTION_CURRENT_VOLUME
+            r1 = mkbptr(volume)
+        elif t == ACTION_DIE
+            r1 = DOSTRUE
+            vivo = false
+        else
+            r2 = ERROR_ACTION_NOT_KNOWN
+        end
+        packet_reply(p, r1, r2)
+    end
+    handler_volume_remove(volume)
+end
+

@@ -1,0 +1,13 @@
+# seahash en el Amiga contra la referencia (herramientas/seahash.py): tamaños 0 a 40 y 4072 de un patrón fijo
+import "../src/seahash.dash"
+
+Main
+    buf = buffer_alloc(4096)
+    for i in (0..4095)
+        buffer_set_byte(buf, i, (i * 7 + 3) & 255)
+    end
+    for n in [0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 40, 4072]
+        lo = seahash(buf, n)
+        Print "#{n} #{str_from_int(seahash_hi, 16)} #{str_from_int(lo, 16)}"
+    end
+end

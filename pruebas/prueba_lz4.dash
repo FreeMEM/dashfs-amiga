@@ -1,0 +1,28 @@
+# LZ4 en el Amiga: un registro comprimido de verdad de un disco DashFS (rec.lz4, 21090 bytes que dan 131072), su
+# seahash contra la del lector de Python (0x6d48015e600e9659), y datos rotos
+import "../src/lz4.dash"
+import "../src/seahash.dash"
+
+func hex32(x: Int) -> String
+    h = str_from_int((x >> 16) & 0xFFFF, 16)
+    l = str_from_int(x & 0xFFFF, 16)
+    while l.length < 4
+        l = "0" + l
+    end
+    return h + l
+end
+
+Main
+    src = buffer_alloc(32768)
+    n = file_load("rec.lz4", src, 32768)
+    dst = buffer_alloc(131072)
+    t = time_ms()
+    r = lz4(src, n, dst, 131072)
+    t = time_ms() - t
+    Print "lz4: #{n} -> #{r}"
+    lo = seahash(dst, r)
+    Print "seahash: #{hex32(seahash_hi)}#{hex32(lo)}"
+    Print "no cabe: #{lz4(src, n, dst, 1000)}"
+    Print "cortado: #{lz4(src, 3, dst, 131072)}"
+    Print "(#{t} ms)"
+end

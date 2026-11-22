@@ -1,0 +1,125 @@
+# seahash 4.1, el de las sumas de DashFS, en ensamblador del 68020 (mulu.l de 64 bits). Necesita --cpu 68020 o más:
+# en un 68060 el mulu.l de 64 bits lo hace la 68060.library (más despacio).
+#
+# seahash(buf, n) da los 32 bits bajos de la suma de n bytes desde buf; seahash_hi, los 32 altos de la última.
+
+var seahash_hi: Int = 0
+
+func seahash(buf: Int, n: Int) -> Int
+    asm in a0 = buf, d0 = n out lo = d0, hi = d1 uses d2-d7/a1-a2
+        lea     .st,a1
+        move.l  #$16f11fe8,(a1)
+        move.l  #$9b0d677c,4(a1)
+        move.l  #$b480a793,8(a1)
+        move.l  #$d8e6c86c,12(a1)
+        move.l  #$6fe2e5aa,16(a1)
+        move.l  #$f078ebc9,20(a1)
+        move.l  #$14f994a4,24(a1)
+        move.l  #$c5259381,28(a1)
+        move.l  d0,d7           ; el largo
+        move.l  d0,d6
+        lsr.l   #3,d6           ; palabras de 8 bytes enteras
+        moveq   #0,d5           ; la parte del estado (0, 8, 16, 24)
+        bra     .cuenta
+    .palabra:
+        move.l  (a0)+,d2        ; bytes 0-3: la mitad baja, en little-endian
+        ror.w   #8,d2
+        swap    d2
+        ror.w   #8,d2
+        move.l  (a0)+,d3        ; bytes 4-7: la alta
+        ror.w   #8,d3
+        swap    d3
+        ror.w   #8,d3
+        bsr     .mezcla
+    .cuenta:
+        subq.l  #1,d6
+        bpl     .palabra
+        move.l  d7,d4           ; lo que sobra, con ceros detrás hasta 8 bytes
+        and.l   #7,d4
+        beq     .final
+        lea     .resto,a2
+        clr.l   (a2)
+        clr.l   4(a2)
+        subq.l  #1,d4
+    .copia:
+        move.b  (a0)+,(a2)+
+        dbra    d4,.copia
+        lea     .resto,a2
+        move.l  (a2),d2
+        ror.w   #8,d2
+        swap    d2
+        ror.w   #8,d2
+        move.l  4(a2),d3
+        ror.w   #8,d3
+        swap    d3
+        ror.w   #8,d3
+        bsr     .mezcla
+    .final:
+        move.l  (a1),d3         ; a ^ b ^ c ^ d ^ largo
+        move.l  4(a1),d2
+        move.l  8(a1),d0
+        eor.l   d0,d3
+        move.l  12(a1),d0
+        eor.l   d0,d2
+        move.l  16(a1),d0
+        eor.l   d0,d3
+        move.l  20(a1),d0
+        eor.l   d0,d2
+        move.l  24(a1),d0
+        eor.l   d0,d3
+        move.l  28(a1),d0
+        eor.l   d0,d2
+        eor.l   d7,d2
+        bsr     .difunde
+        move.l  d2,d0
+        move.l  d3,d1
+        bra     .fuera
+
+    ; la parte d5 del estado ^= d3:d2, difundida; la siguiente parte
+    .mezcla:
+        eor.l   d3,0(a1,d5.l)
+        eor.l   d2,4(a1,d5.l)
+        move.l  0(a1,d5.l),d3
+        move.l  4(a1,d5.l),d2
+        bsr     .difunde
+        move.l  d3,0(a1,d5.l)
+        move.l  d2,4(a1,d5.l)
+        addq.l  #8,d5
+        and.l   #31,d5
+        rts
+
+    ; d3:d2 = diffuse(d3:d2): x *= K; x ^= (x >> 32) >> (x >> 60); x *= K
+    .difunde:
+        bsr     .por_k
+        move.l  d3,d4
+        moveq   #28,d0
+        lsr.l   d0,d4
+        move.l  d3,d0
+        lsr.l   d4,d0
+        eor.l   d0,d2
+        bsr     .por_k
+        rts
+
+    ; d3:d2 *= $6eed0e9da4d94a4f (los 64 bits bajos); pisa d0, d1, d4
+    .por_k:
+        move.l  d2,d1
+        mulu.l  #$a4d94a4f,d0:d1
+        move.l  d2,d4
+        mulu.l  #$6eed0e9d,d4
+        add.l   d4,d0
+        mulu.l  #$a4d94a4f,d3
+        add.l   d0,d3
+        move.l  d1,d2
+        rts
+
+        bss
+    .st:
+        ds.l    8
+    .resto:
+        ds.l    2
+        code
+    .fuera:
+    end
+    seahash_hi = hi
+    return lo
+end

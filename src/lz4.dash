@@ -1,0 +1,96 @@
+# Descomprimir un bloque LZ4 (sin marco), como lz4_flex::decompress_into de DashFS, en ensamblador del 68000.
+#
+# lz4(src, n, dst, max): los bytes que dejó en dst, o -1 si los datos están rotos o no caben en max.
+
+func lz4(src: Int, n: Int, dst: Int, max: Int) -> Int
+    asm in a0 = src, d0 = n, a1 = dst, d1 = max out r = d0 uses d2-d5/a2-a4/a6
+        move.l  a0,a2
+        add.l   d0,a2           ; el final de lo comprimido
+        move.l  a1,a3           ; el principio de la salida
+        move.l  a1,a4
+        add.l   d1,a4           ; su final
+    .secuencia:
+        cmp.l   a2,a0
+        bhs     .hecho
+        moveq   #0,d2
+        move.b  (a0)+,d2        ; la ficha
+        move.l  d2,d3
+        lsr.l   #4,d3           ; cuántos literales
+        cmp.l   #15,d3
+        bne     .literales
+    .mas_lit:
+        cmp.l   a2,a0
+        bhs     .roto
+        moveq   #0,d4
+        move.b  (a0)+,d4
+        add.l   d4,d3
+        cmp.l   #255,d4
+        beq     .mas_lit
+    .literales:
+        move.l  a0,d4
+        add.l   d3,d4
+        cmp.l   a2,d4
+        bhi     .roto
+        move.l  a1,d4
+        add.l   d3,d4
+        cmp.l   a4,d4
+        bhi     .roto
+        bra     .cuenta_lit
+    .copia_lit:
+        move.b  (a0)+,(a1)+
+    .cuenta_lit:
+        subq.l  #1,d3
+        bpl     .copia_lit
+        cmp.l   a2,a0
+        bhs     .hecho          ; la última secuencia no tiene copia
+        move.l  a0,d4
+        addq.l  #2,d4
+        cmp.l   a2,d4
+        bhi     .roto
+        moveq   #0,d4
+        move.b  (a0)+,d4
+        moveq   #0,d5
+        move.b  (a0)+,d5
+        lsl.l   #8,d5
+        or.l    d5,d4           ; de cuántos bytes atrás
+        beq     .roto
+        move.l  a1,d5
+        sub.l   a3,d5
+        cmp.l   d5,d4
+        bhi     .roto
+        move.l  a1,a6
+        sub.l   d4,a6
+        and.l   #15,d2          ; cuántos copia (menos 4)
+        cmp.l   #15,d2
+        bne     .copia
+    .mas_cop:
+        cmp.l   a2,a0
+        bhs     .roto
+        moveq   #0,d4
+        move.b  (a0)+,d4
+        add.l   d4,d2
+        cmp.l   #255,d4
+        beq     .mas_cop
+    .copia:
+        addq.l  #4,d2
+        move.l  a1,d4
+        add.l   d2,d4
+        cmp.l   a4,d4
+        bhi     .roto
+        bra     .cuenta_cop
+    .copia_cop:
+        move.b  (a6)+,(a1)+
+    .cuenta_cop:
+        subq.l  #1,d2
+        bpl     .copia_cop
+        bra     .secuencia
+    .hecho:
+        move.l  a1,d0
+        sub.l   a3,d0
+        bra     .fuera
+    .roto:
+        moveq   #-1,d0
+    .fuera:
+    end
+    return r
+end

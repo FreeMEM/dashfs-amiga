@@ -1,0 +1,13 @@
+[package]
+name = "dashfs-amiga-herramientas"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Discos DashFS de prueba para el handler del Amiga, con el RedoxFS de DashOS (su formato, MIT)
+[dependencies]
+redoxfs = { path = "../../dashos/archivos/redoxfs", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "hacer_disco"
+path = "src/hacer_disco.rs"
