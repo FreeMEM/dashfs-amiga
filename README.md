@@ -62,3 +62,9 @@ Los nombres en UTF-8 se ven en Latin-1; un carácter que Latin-1 no tiene sale c
 - `pruebas/prueba_seahash.dash` y `pruebas/prueba_lz4.dash`: las piezas en ensamblador contra la referencia.
 
 Plan y bitácora: `docs/HANDLER_LOOP.md` del repo de Dash.
+
+## Licencia
+
+[Mozilla Public License 2.0](LICENSE). Se puede usar dentro de cualquier sistema, también uno cerrado; si se cambian
+los ficheros de este handler, esos cambios se publican con la misma licencia. Créditos del formato (RedoxFS, MIT) en
+[NOTICE](NOTICE).

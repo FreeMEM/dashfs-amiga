@@ -1,0 +1,11 @@
+DashFS para AmigaOS 3.x
+Copyright (c) 2026 Francisco Antonio Tapias Bravo (FreeMEM)
+
+Licencia: Mozilla Public License 2.0 (fichero LICENSE).
+
+El formato DashFS es el de DashOS (https://github.com/FreeMEM/dashos, archivos/redoxfs), que parte de RedoxFS
+(https://gitlab.redox-os.org/redox-os/redoxfs), de Jeremy Soller y los autores de Redox, con licencia MIT.
+Este handler no lleva código de RedoxFS: lee el formato con código propio en Dash. La herramienta herramientas/
+(hacer_disco) enlaza el RedoxFS de DashOS para crear discos de prueba; ese código sigue con su licencia MIT.
+
+El handler se compila con Dash (https://github.com/FreeMEM/dash), con licencia MIT; su runtime no añade condiciones.
